@@ -394,6 +394,28 @@ DecoTV 支持标准的苹果 CMS V10 API 格式。
 
 dockge/komodo 等 docker compose UI 也有自动更新功能
 
+## 播放卡顿与部署地区说明
+
+DecoTV 现在默认使用 `NEXT_PUBLIC_PLAYBACK_PROXY_MODE=smart`。播放页会先检测 m3u8、key、首个分片、Range 和浏览器 CORS，再决定直连、只代理播放列表，或在最后兜底代理 key/map/segment。
+
+- 美国 Oracle Cloud 圣何塞 VPS：搜索和详情可能正常，但如果代理 ts/m4s 分片，所有视频流量都会绕到美国 VPS，亚洲资源站通常会明显变慢。推荐 `NEXT_PUBLIC_PLAYBACK_PROXY_MODE=smart`、`PLAYBACK_PROXY_SEGMENTS=false`，不要默认强制 `proxy`。
+- Vercel：Serverless 适合 API、详情和短 m3u8 manifest 处理，不适合长时间大量中转视频分片。推荐 smart，并保持 `PLAYBACK_PROXY_SEGMENTS=false`，避免函数超时和高流量。
+- 中国大陆用户：更适合香港、新加坡、日本、韩国或家庭宽带/NAS 部署。美国机房通常不适合作为视频分片中转，优先让浏览器 direct 播放。
+- 家庭 NAS / 飞牛 OS / 1Panel Docker：推荐 public 模式配合 smart 播放策略。局域网播放时优先直连，服务器主要负责搜索、详情和必要的 manifest 兼容处理。
+
+常用播放环境变量：
+
+```bash
+NEXT_PUBLIC_PLAYBACK_PROXY_MODE=smart
+PLAYBACK_HEALTH_CHECK=true
+PLAYBACK_HEALTH_TIMEOUT_MS=8000
+PLAYBACK_FIRST_SEGMENT_TEST=true
+PLAYBACK_PROXY_SEGMENTS=false
+PLAYBACK_MAX_AUTO_SWITCH=3
+PLAYBACK_BAD_SOURCE_TTL=1800
+PLAYBACK_GOOD_SOURCE_TTL=86400
+```
+
 ## 🌍 环境变量
 
 ### 基础配置

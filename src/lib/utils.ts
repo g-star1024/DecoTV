@@ -3,6 +3,7 @@ import he from 'he';
 import Hls from 'hls.js';
 
 import { resolveImageUrl } from './image-url';
+import type { PlaybackHealthResult } from './player/hls-utils';
 
 export function processImageUrl(originalUrl: string): string {
   return resolveImageUrl(originalUrl, { wsrvWidth: 256 });
@@ -20,6 +21,10 @@ export interface VideoSourceTestResult {
   message?: string;
   playable?: boolean;
   testedAt?: number;
+  health?: PlaybackHealthResult;
+  recommendedStrategy?: PlaybackHealthResult['recommendedStrategy'];
+  grade?: PlaybackHealthResult['grade'];
+  score?: number;
 }
 
 const DEFAULT_SOURCE_TEST_TIMEOUT_MS = 10000;
@@ -204,7 +209,14 @@ async function measureNativeVideoSource(
 
 export async function getVideoResolutionFromM3u8(
   m3u8Url: string,
-  options: { timeoutMs?: number } = {},
+  options: {
+    timeoutMs?: number;
+    source?: string;
+    sourceName?: string;
+    title?: string;
+    episodeIndex?: number;
+    useServerHealth?: boolean;
+  } = {},
 ): Promise<VideoSourceTestResult> {
   if (!m3u8Url) {
     return buildResult({
@@ -225,6 +237,11 @@ export async function getVideoResolutionFromM3u8(
   }
 
   const timeoutMs = options.timeoutMs || DEFAULT_SOURCE_TEST_TIMEOUT_MS;
+
+  if (options.useServerHealth !== false) {
+    const healthResult = await getPlaybackHealthFromServer(m3u8Url, options);
+    if (healthResult) return healthResult;
+  }
 
   if (!isLikelyHlsUrl(m3u8Url) || !Hls.isSupported()) {
     return measureNativeVideoSource(m3u8Url, timeoutMs);
@@ -406,6 +423,123 @@ export async function getVideoResolutionFromM3u8(
       );
     }
   });
+}
+
+async function probeBrowserCors(
+  url: string,
+  timeoutMs: number,
+): Promise<{ readable: boolean; reason?: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      mode: 'cors',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return { readable: false, reason: `HTTP ${response.status}` };
+    }
+    await response.body?.cancel().catch(() => undefined);
+    return { readable: true };
+  } catch (error) {
+    const aborted =
+      error instanceof DOMException && error.name === 'AbortError';
+    return {
+      readable: false,
+      reason: aborted ? 'CORS check timeout' : 'CORS blocked',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildResultFromHealth(
+  health: PlaybackHealthResult,
+): VideoSourceTestResult {
+  const selectedHeight = health.manifest?.selectedVariant?.height || 0;
+  const quality =
+    selectedHeight > 0
+      ? qualityFromWidth(selectedHeight)
+      : health.urlType === 'mp4'
+        ? 'MP4'
+        : '未知';
+  const firstSegmentMs = health.firstSegment?.timeToFirstByteMs || 0;
+  const firstChunkBytes = health.firstSegment?.firstChunkBytes || 0;
+  const speedKBps =
+    firstSegmentMs > 0 && firstChunkBytes > 0
+      ? firstChunkBytes / 1024 / (firstSegmentMs / 1000)
+      : undefined;
+  const pingTime =
+    firstSegmentMs ||
+    health.timings?.manifestMs ||
+    health.timings?.mediaManifestMs ||
+    0;
+
+  return {
+    quality,
+    loadSpeed: formatVideoLoadSpeed(speedKBps),
+    pingTime: Math.round(pingTime),
+    speedKBps,
+    hasError: !health.playable,
+    status: health.playable ? 'ok' : health.manifest?.ok ? 'partial' : 'failed',
+    message:
+      health.reason || (health.playable ? '播放链路可用' : '播放链路异常'),
+    playable: health.playable,
+    testedAt: Date.now(),
+    health,
+    recommendedStrategy: health.recommendedStrategy,
+    grade: health.grade,
+    score: health.score,
+  };
+}
+
+async function getPlaybackHealthFromServer(
+  m3u8Url: string,
+  options: {
+    timeoutMs?: number;
+    source?: string;
+    sourceName?: string;
+    title?: string;
+    episodeIndex?: number;
+  },
+): Promise<VideoSourceTestResult | null> {
+  try {
+    const params = new URLSearchParams({
+      url: m3u8Url,
+      strategy: 'smart',
+    });
+    if (options.source) params.set('source', options.source);
+    if (options.title) params.set('title', options.title);
+    if (options.episodeIndex !== undefined) {
+      params.set('episodeIndex', String(options.episodeIndex));
+    }
+
+    const response = await fetch(`/api/playback/health?${params.toString()}`, {
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+
+    const health = (await response.json()) as PlaybackHealthResult;
+    if (typeof window !== 'undefined' && health.urlType === 'hls') {
+      const cors = await probeBrowserCors(
+        m3u8Url,
+        Math.min(3000, options.timeoutMs || DEFAULT_SOURCE_TEST_TIMEOUT_MS),
+      );
+      health.cors = {
+        ...(health.cors || {}),
+        manifestReadable: cors.readable,
+        checkedInBrowser: true,
+        reason: cors.readable ? undefined : cors.reason,
+      };
+      if (!cors.readable && health.recommendedStrategy === 'direct') {
+        health.recommendedStrategy = 'manifest-proxy';
+      }
+    }
+    return buildResultFromHealth(health);
+  } catch {
+    return null;
+  }
 }
 
 export function cleanHtmlTags(text: string) {

@@ -88,6 +88,16 @@ export interface AdminConfig {
     disabled?: boolean;
     is_adult?: boolean;
     disable_ad_filter?: boolean;
+    proxyStrategy?: 'auto' | 'direct' | 'proxy' | 'manifest-only';
+    ua?: string;
+    referer?: string;
+    origin?: string;
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    priority?: number;
+    regionHint?: string;
+    adult?: boolean;
+    disabledReason?: string;
   }[];
   CustomCategories: {
     name?: string;

@@ -2,18 +2,16 @@
 
 import { NextResponse } from 'next/server';
 
+import { getConfig } from '@/lib/config';
 import { verifyM3U8ProxySignature } from '@/lib/m3u8-proxy';
+import { buildPlaybackRequestHeaders } from '@/lib/player/stream-health';
 import {
   fetchWithValidatedRedirects,
-  normalizeHeaderUrl,
   validateProxyTargetUrl,
 } from '@/lib/proxy-security';
 
 export const runtime = 'nodejs';
 
-const DEFAULT_UA =
-  'Mozilla/5.0 (Linux; Android 10; AndroidTV) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const FETCH_TIMEOUT_MS = 15000;
 const MAX_REDIRECTS = 3;
 
@@ -26,13 +24,25 @@ function withCorsHeaders(headers: Headers) {
   );
   headers.set(
     'Access-Control-Expose-Headers',
-    'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+    [
+      'Content-Length',
+      'Content-Range',
+      'Accept-Ranges',
+      'Content-Type',
+      'X-DecoTV-Playback-Strategy',
+      'X-DecoTV-Source',
+      'X-DecoTV-Upstream-Status',
+      'X-DecoTV-Upstream-Duration',
+      'X-DecoTV-Proxy-Cache',
+      'X-DecoTV-Error-Reason',
+    ].join(', '),
   );
 }
 
 function jsonError(error: string, status: number, details?: string) {
   const headers = new Headers();
   withCorsHeaders(headers);
+  headers.set('X-DecoTV-Error-Reason', error);
   return NextResponse.json({ error, details }, { status, headers });
 }
 
@@ -75,27 +85,23 @@ function copyHeader(
   }
 }
 
-function resolveReferer(
-  decodedUrl: string,
-  request: Request,
-  explicit?: string,
-) {
-  const sanitizedExplicitReferer = normalizeHeaderUrl(explicit);
-  const inboundReferer = normalizeHeaderUrl(request.headers.get('referer'));
-  let fallbackReferer: string | undefined;
-  try {
-    fallbackReferer = new URL(decodedUrl).origin + '/';
-  } catch {
-    fallbackReferer = undefined;
-  }
-  return sanitizedExplicitReferer || fallbackReferer || inboundReferer;
+async function findSourceConfig(source: string | null) {
+  if (!source) return undefined;
+  const config = await getConfig();
+  return (
+    config.SourceConfig?.find((item: any) => item.key === source) ||
+    config.LiveConfig?.find((item: any) => item.key === source)
+  );
 }
 
 async function handleAssetRequest(request: Request, method: 'GET' | 'HEAD') {
+  const startedAt = Date.now();
   const { searchParams } = new URL(request.url);
   const url = searchParams.get('url');
   const referer = searchParams.get('referer') || undefined;
   const kind = searchParams.get('kind');
+  const source =
+    searchParams.get('source') || searchParams.get('decotv-source') || null;
 
   if (!url) {
     return jsonError('Missing url', 400);
@@ -116,25 +122,15 @@ async function handleAssetRequest(request: Request, method: 'GET' | 'HEAD') {
     return jsonError(e?.message || 'Invalid url', 400);
   }
 
-  const refererToSend = resolveReferer(decodedUrl, request, referer);
-  const requestHeaders: Record<string, string> = {
-    Accept: '*/*',
-    'User-Agent': request.headers.get('user-agent') || DEFAULT_UA,
-  };
-
-  if (refererToSend) {
-    requestHeaders.Referer = refererToSend;
-    try {
-      requestHeaders.Origin = new URL(refererToSend).origin;
-    } catch {
-      // ignore
-    }
-  }
-
+  const sourceConfig = await findSourceConfig(source);
   const range = request.headers.get('range');
-  if (range) {
-    requestHeaders.Range = range;
-  }
+  const requestHeaders = buildPlaybackRequestHeaders({
+    url: decodedUrl,
+    sourceConfig,
+    userAgent: request.headers.get('user-agent') || undefined,
+    referer,
+    range: range || undefined,
+  });
 
   let upstream: Response;
   try {
@@ -162,6 +158,11 @@ async function handleAssetRequest(request: Request, method: 'GET' | 'HEAD') {
     kind === 'key' ? 'public, max-age=3600' : 'no-cache',
   );
   headers.set('Vary', 'Range');
+  headers.set('X-DecoTV-Playback-Strategy', 'asset-proxy');
+  headers.set('X-DecoTV-Source', source || '');
+  headers.set('X-DecoTV-Upstream-Status', String(upstream.status));
+  headers.set('X-DecoTV-Upstream-Duration', String(Date.now() - startedAt));
+  headers.set('X-DecoTV-Proxy-Cache', 'miss');
   copyHeader(upstream.headers, headers, 'content-type', 'Content-Type');
   copyHeader(upstream.headers, headers, 'content-length', 'Content-Length');
   copyHeader(upstream.headers, headers, 'content-range', 'Content-Range');

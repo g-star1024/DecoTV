@@ -11,8 +11,18 @@ export interface ApiSite {
   api: string;
   name: string;
   detail?: string;
+  disable_ad_filter?: boolean;
+  proxyStrategy?: 'auto' | 'direct' | 'proxy' | 'manifest-only';
+  ua?: string;
+  referer?: string;
+  origin?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  priority?: number;
+  regionHint?: string;
+  adult?: boolean;
+  disabledReason?: string;
   is_adult?: boolean; // 标记是否为成人资源
-  disable_ad_filter?: boolean; // 该源不走 m3u8 广告过滤代理
 }
 
 export interface LiveCfg {
@@ -81,6 +91,87 @@ function normalizeForComparison(value: unknown): unknown {
   }
 
   return value;
+}
+
+function isProbablyAdultSourceName(name?: string): boolean {
+  const value = (name || '').toLowerCase();
+  return (
+    value.includes('🔞') ||
+    value.includes('成人') ||
+    value.includes('福利') ||
+    value.includes('倫理') ||
+    value.includes('伦理') ||
+    value.includes('18+') ||
+    value.includes('adult') ||
+    value.includes('porn')
+  );
+}
+
+function sanitizeHeaders(headers: unknown): Record<string, string> | undefined {
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(headers as Record<string, unknown>)
+    .filter(([, value]) => typeof value === 'string' && value.trim())
+    .map(([key, value]) => [key, String(value)] as const);
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function normalizeSourceExtra<T extends Partial<ApiSite>>(source: T): T {
+  if (
+    source.proxyStrategy &&
+    !['auto', 'direct', 'proxy', 'manifest-only'].includes(source.proxyStrategy)
+  ) {
+    delete source.proxyStrategy;
+  }
+
+  const timeoutMs = Number(source.timeoutMs);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    source.timeoutMs = Math.round(timeoutMs);
+  } else {
+    delete source.timeoutMs;
+  }
+
+  const priority = Number(source.priority);
+  if (Number.isFinite(priority)) {
+    source.priority = Math.round(priority);
+  } else {
+    delete source.priority;
+  }
+
+  const headers = sanitizeHeaders(source.headers);
+  if (headers) {
+    source.headers = headers;
+  } else {
+    delete source.headers;
+  }
+
+  if (source.adult !== undefined && source.is_adult === undefined) {
+    source.is_adult = Boolean(source.adult);
+  }
+  if (isProbablyAdultSourceName(source.name) && !source.is_adult) {
+    source.is_adult = true;
+    source.adult = true;
+  }
+  return source;
+}
+
+function copySourceExtra(source: Partial<ApiSite>): Partial<ApiSite> {
+  return normalizeSourceExtra({
+    disable_ad_filter: source.disable_ad_filter,
+    proxyStrategy: source.proxyStrategy,
+    ua: source.ua,
+    referer: source.referer,
+    origin: source.origin,
+    headers: sanitizeHeaders(source.headers),
+    timeoutMs: source.timeoutMs,
+    priority: source.priority,
+    regionHint: source.regionHint,
+    adult: source.adult,
+    disabledReason: source.disabledReason,
+  });
 }
 
 function isConfigConsistent(
@@ -154,6 +245,8 @@ export function refineConfig(adminConfig: AdminConfig): AdminConfig {
       existingSource.api = site.api;
       existingSource.detail = site.detail;
       existingSource.is_adult = site.is_adult || false;
+      Object.assign(existingSource, copySourceExtra(site));
+      normalizeSourceExtra(existingSource);
       existingSource.from = 'config';
     } else {
       // 如果不存在,创建新条目
@@ -162,7 +255,9 @@ export function refineConfig(adminConfig: AdminConfig): AdminConfig {
         name: site.name,
         api: site.api,
         detail: site.detail,
-        is_adult: site.is_adult || false,
+        is_adult:
+          site.is_adult || site.adult || isProbablyAdultSourceName(site.name),
+        ...copySourceExtra(site),
         from: 'config',
         disabled: false,
       });
@@ -354,7 +449,9 @@ async function getInitConfig(
       name: site.name,
       api: site.api,
       detail: site.detail,
-      is_adult: site.is_adult || false,
+      is_adult:
+        site.is_adult || site.adult || isProbablyAdultSourceName(site.name),
+      ...copySourceExtra(site),
       from: 'config',
       disabled: false,
     });
@@ -617,6 +714,7 @@ export function configSelfCheck(adminConfig: AdminConfig): AdminConfig {
       return false;
     }
     seenSourceKeys.add(source.key);
+    normalizeSourceExtra(source);
     return true;
   });
 
@@ -694,6 +792,7 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
         detail: s.detail,
         is_adult: s.is_adult,
         disable_ad_filter: s.disable_ad_filter,
+        ...copySourceExtra(s),
       }));
   }
 
@@ -721,6 +820,7 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
           detail: s.detail,
           is_adult: s.is_adult,
           disable_ad_filter: s.disable_ad_filter,
+          ...copySourceExtra(s),
         }));
     }
   }

@@ -78,6 +78,9 @@ export const UserMenu: React.FC = () => {
   const [playerBufferMode, setPlayerBufferMode] = useState<
     'standard' | 'enhanced' | 'max'
   >('standard');
+  const [playbackProxyMode, setPlaybackProxyMode] = useState<
+    'smart' | 'direct' | 'proxy' | 'off'
+  >('smart');
   const [doubanDataSource, setDoubanDataSource] = useState(
     'cmliussss-cdn-tencent',
   );
@@ -120,6 +123,29 @@ export const UserMenu: React.FC = () => {
   ];
 
   // 豆瓣数据源选项
+  const playbackProxyModeOptions = [
+    {
+      value: 'smart' as const,
+      label: '智能',
+      description: '优先直连，失败后再尝试列表代理和分片代理',
+    },
+    {
+      value: 'direct' as const,
+      label: '直连',
+      description: '浏览器直接访问视频地址，服务器不转发分片',
+    },
+    {
+      value: 'proxy' as const,
+      label: '代理',
+      description: '强制使用服务端代理，仅适合带宽充足的自用部署',
+    },
+    {
+      value: 'off' as const,
+      label: '关闭代理',
+      description: '禁用 DecoTV 播放代理，只使用原始 URL',
+    },
+  ];
+
   const doubanDataSourceOptions = [
     { value: 'auto', label: '智能自动（推荐）' },
     { value: 'direct', label: '直连（服务器直接请求豆瓣）' },
@@ -264,6 +290,20 @@ export const UserMenu: React.FC = () => {
         savedBufferMode === 'max'
       ) {
         setPlayerBufferMode(savedBufferMode);
+      }
+
+      const savedPlaybackProxyMode = localStorage.getItem('playbackProxyMode');
+      const runtimePlaybackProxyMode =
+        (window as any).RUNTIME_CONFIG?.PLAYBACK_PROXY_MODE || 'smart';
+      const nextPlaybackProxyMode =
+        savedPlaybackProxyMode || runtimePlaybackProxyMode;
+      if (
+        nextPlaybackProxyMode === 'smart' ||
+        nextPlaybackProxyMode === 'direct' ||
+        nextPlaybackProxyMode === 'proxy' ||
+        nextPlaybackProxyMode === 'off'
+      ) {
+        setPlaybackProxyMode(nextPlaybackProxyMode);
       }
     }
   }, []);
@@ -465,6 +505,15 @@ export const UserMenu: React.FC = () => {
     }
   };
 
+  const handlePlaybackProxyModeChange = (
+    value: 'smart' | 'direct' | 'proxy' | 'off',
+  ) => {
+    setPlaybackProxyMode(value);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('playbackProxyMode', value);
+    }
+  };
+
   const handleDoubanDataSourceChange = (value: string) => {
     setDoubanDataSource(value);
     if (typeof window !== 'undefined') {
@@ -557,6 +606,8 @@ export const UserMenu: React.FC = () => {
       (window as any).RUNTIME_CONFIG?.DOUBAN_IMAGE_PROXY || '';
     const defaultFluidSearch =
       (window as any).RUNTIME_CONFIG?.FLUID_SEARCH !== false;
+    const defaultPlaybackProxyMode =
+      (window as any).RUNTIME_CONFIG?.PLAYBACK_PROXY_MODE || 'smart';
 
     setDefaultAggregateSearch(true);
     setEnableOptimization(true);
@@ -567,6 +618,7 @@ export const UserMenu: React.FC = () => {
     setDoubanImageProxyType(defaultDoubanImageProxyType);
     setDoubanImageProxyUrl(defaultDoubanImageProxyUrl);
     setPlayerBufferMode('standard');
+    setPlaybackProxyMode(defaultPlaybackProxyMode);
 
     if (typeof window !== 'undefined') {
       localStorage.setItem('defaultAggregateSearch', JSON.stringify(true));
@@ -578,6 +630,7 @@ export const UserMenu: React.FC = () => {
       localStorage.setItem('doubanImageProxyType', defaultDoubanImageProxyType);
       localStorage.setItem('doubanImageProxyUrl', defaultDoubanImageProxyUrl);
       localStorage.setItem('playerBufferMode', 'standard');
+      localStorage.setItem('playbackProxyMode', defaultPlaybackProxyMode);
       window.dispatchEvent(new CustomEvent('doubanProxyChanged'));
     }
   };
@@ -1269,6 +1322,44 @@ export const UserMenu: React.FC = () => {
                   );
                 })}
               </div>
+            </div>
+          </div>
+
+          <div className='mt-6 space-y-3'>
+            <div>
+              <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300'>
+                播放代理策略
+              </h4>
+              <p className='text-xs text-gray-400 dark:text-gray-500 mt-1'>
+                默认智能模式优先直连，只有必要时才走服务端代理
+              </p>
+            </div>
+            <div className='grid grid-cols-2 gap-2'>
+              {playbackProxyModeOptions.map((option) => {
+                const isSelected = playbackProxyMode === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type='button'
+                    onClick={() => handlePlaybackProxyModeChange(option.value)}
+                    className={`rounded-lg border p-2 text-left transition ${
+                      isSelected
+                        ? 'border-green-400 bg-green-50 text-green-700 dark:border-green-500/60 dark:bg-green-900/20 dark:text-green-300'
+                        : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200'
+                    }`}
+                  >
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-sm font-medium'>
+                        {option.label}
+                      </span>
+                      {isSelected && <Check className='h-4 w-4' />}
+                    </div>
+                    <p className='mt-1 line-clamp-2 text-xs opacity-75'>
+                      {option.description}
+                    </p>
+                  </button>
+                );
+              })}
             </div>
           </div>
 

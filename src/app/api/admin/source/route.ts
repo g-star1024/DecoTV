@@ -25,6 +25,23 @@ interface BaseBody {
   action?: Action;
 }
 
+function pickSourcePlaybackFields(body: Record<string, any>) {
+  const fields: Record<string, any> = {};
+  if (body.proxyStrategy) fields.proxyStrategy = body.proxyStrategy;
+  if (body.ua) fields.ua = body.ua;
+  if (body.referer) fields.referer = body.referer;
+  if (body.origin) fields.origin = body.origin;
+  if (body.headers && typeof body.headers === 'object') {
+    fields.headers = body.headers;
+  }
+  if (body.timeoutMs) fields.timeoutMs = Number(body.timeoutMs);
+  if (body.priority !== undefined) fields.priority = Number(body.priority);
+  if (body.regionHint) fields.regionHint = body.regionHint;
+  if (body.adult !== undefined) fields.adult = Boolean(body.adult);
+  if (body.disabledReason) fields.disabledReason = body.disabledReason;
+  return fields;
+}
+
 export async function POST(request: NextRequest) {
   // 预检 auth secret，缺失时在开发/Docker 环境下给出警告
   getAuthSecret();
@@ -110,6 +127,7 @@ export async function POST(request: NextRequest) {
           api,
           detail,
           is_adult: is_adult || false,
+          ...pickSourcePlaybackFields(body),
           from: 'custom',
           disabled: false,
         });

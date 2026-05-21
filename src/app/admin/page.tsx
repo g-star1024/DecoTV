@@ -372,9 +372,40 @@ interface DataSource {
   api: string;
   detail?: string;
   disabled?: boolean;
+  proxyStrategy?: 'auto' | 'direct' | 'proxy' | 'manifest-only';
+  ua?: string;
+  referer?: string;
+  origin?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  priority?: number;
+  regionHint?: string;
+  adult?: boolean;
+  disabledReason?: string;
   is_adult?: boolean; // 标记是否为成人资源
   disable_ad_filter?: boolean; // 该源不走 m3u8 广告过滤代理
   from: 'config' | 'custom';
+}
+
+const ADULT_SOURCE_PATTERN = /🔞|成人|福利|倫理|伦理|18\+|adult|porn|xxx/i;
+
+function isProbablyAdultSourceName(name?: string) {
+  return ADULT_SOURCE_PATTERN.test(name || '');
+}
+
+function getSourcePlaybackFields(item: Record<string, any>) {
+  const fields: Record<string, any> = {};
+  if (item.proxyStrategy) fields.proxyStrategy = item.proxyStrategy;
+  if (item.ua) fields.ua = item.ua;
+  if (item.referer) fields.referer = item.referer;
+  if (item.origin) fields.origin = item.origin;
+  if (item.headers && typeof item.headers === 'object')
+    fields.headers = item.headers;
+  if (item.timeoutMs) fields.timeoutMs = Number(item.timeoutMs);
+  if (item.priority !== undefined) fields.priority = Number(item.priority);
+  if (item.regionHint) fields.regionHint = item.regionHint;
+  if (item.disabledReason) fields.disabledReason = item.disabledReason;
+  return fields;
 }
 
 // 直播源数据类型
@@ -2708,6 +2739,7 @@ const VideoSourceConfig = ({
             detail: payload.detail || '',
             disabled: false,
             is_adult: payload.is_adult || false,
+            ...getSourcePlaybackFields(payload),
             from: 'custom',
           };
           sources.push(newSource);
@@ -2904,6 +2936,7 @@ const VideoSourceConfig = ({
         api: newSource.api,
         detail: newSource.detail,
         is_adult: newSource.is_adult || false,
+        ...getSourcePlaybackFields(newSource),
       });
       setNewSource({
         name: '',
@@ -3255,6 +3288,10 @@ const VideoSourceConfig = ({
           if (source.is_adult) {
             apiSiteObj[source.key].is_adult = source.is_adult;
           }
+          Object.assign(
+            apiSiteObj[source.key],
+            getSourcePlaybackFields(source),
+          );
         });
 
         exportData = {
@@ -3375,7 +3412,12 @@ const VideoSourceConfig = ({
             name: item.name,
             api: item.api,
             detail: item.detail || '',
-            is_adult: item.is_adult || false,
+            is_adult:
+              item.is_adult ||
+              item.adult ||
+              isProbablyAdultSourceName(item.name),
+            adult: item.adult,
+            ...getSourcePlaybackFields(item),
           });
 
           result.success++;
@@ -3383,6 +3425,10 @@ const VideoSourceConfig = ({
             name: item.name,
             key: item.key,
             status: 'success',
+            reason:
+              !item.is_adult && isProbablyAdultSourceName(item.name)
+                ? '检测到疑似成人源，已自动标记成人内容'
+                : undefined,
           });
         } catch (err) {
           result.failed++;
@@ -4900,7 +4946,11 @@ const ConfigFileComponent = ({
           name: site.name,
           api: site.api,
           detail: site.detail,
-          is_adult: site.is_adult || false,
+          is_adult:
+            site.is_adult ||
+            (site as any).adult ||
+            isProbablyAdultSourceName(site.name),
+          ...(getSourcePlaybackFields(site as any) as Partial<DataSource>),
           from: 'config' as const,
           disabled: false,
         }),

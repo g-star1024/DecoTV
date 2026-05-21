@@ -113,6 +113,8 @@ export default async function RootLayout({
     PRIVATE_LIBRARY_ENABLED: privateLibraryEnabled,
     AUTH_MODE: getAuthMode(),
     PUBLIC_ALLOW_ADMIN: isPublicAdminAllowed(),
+    PLAYBACK_PROXY_MODE: process.env.NEXT_PUBLIC_PLAYBACK_PROXY_MODE || 'smart',
+    PLAYBACK_MAX_AUTO_SWITCH: Number(process.env.PLAYBACK_MAX_AUTO_SWITCH) || 3,
   };
 
   return (

@@ -51,6 +51,8 @@ export async function GET(request: NextRequest) {
       config.SiteConfig.SearchResultLoadMode === 'pagination'
         ? 'pagination'
         : 'infinite',
+    PlaybackProxyMode: process.env.NEXT_PUBLIC_PLAYBACK_PROXY_MODE || 'smart',
+    PlaybackMaxAutoSwitch: Number(process.env.PLAYBACK_MAX_AUTO_SWITCH) || 3,
     // 提供说明信息
     AdultFilterInfo: {
       enabled: adultFilterEnabled,

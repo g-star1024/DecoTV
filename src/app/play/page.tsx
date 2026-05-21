@@ -39,6 +39,19 @@ import {
   attachNextEpisodeCountdown,
   attachShortcutsOverlay,
 } from '@/lib/player/decoArtplayerTheme';
+import type {
+  PlaybackHealthResult,
+  PlaybackProxyMode,
+  PlaybackStrategy,
+  PlaybackStreamType,
+} from '@/lib/player/hls-utils';
+import {
+  getSourceQualityWeight,
+  isSourceTemporarilyBad,
+  markSourcePlaybackFailure,
+  markSourcePlaybackSuccess,
+  updateSourceQualityFromHealth,
+} from '@/lib/player/source-quality-store';
 import { SearchResult } from '@/lib/types';
 import { generateCacheKey, globalCache } from '@/lib/unified-cache';
 import {
@@ -626,6 +639,14 @@ function PlayPageClient() {
   const detailRef = useRef<SearchResult | null>(detail);
   const currentEpisodeIndexRef = useRef(currentEpisodeIndex);
   const privateProgressSyncRef = useRef<number>(0);
+  const playbackStrategyRef = useRef<PlaybackStrategy>('direct');
+  const playbackAttemptsRef = useRef({
+    strategySwitches: 0,
+    sourceSwitches: 0,
+    lastRawUrl: '',
+  });
+  const hlsErrorCountRef = useRef<Record<string, number>>({});
+  const reportedPlaybackSuccessRef = useRef('');
 
   // 同步最新值到 refs
   useEffect(() => {
@@ -646,6 +667,31 @@ function PlayPageClient() {
 
   // 视频播放地址
   const [videoUrl, setVideoUrl] = useState('');
+  const [resolvedPlaybackUrl, setResolvedPlaybackUrl] = useState('');
+  const [playbackStrategy, setPlaybackStrategy] =
+    useState<PlaybackStrategy>('direct');
+  const [playbackStreamType, setPlaybackStreamType] =
+    useState<PlaybackStreamType>('unknown');
+  const [playbackStatus, setPlaybackStatus] = useState<
+    | 'idle'
+    | 'resolving'
+    | 'testing'
+    | 'loading-manifest'
+    | 'loading-first-segment'
+    | 'playing'
+    | 'buffering'
+    | 'recovering'
+    | 'switching-strategy'
+    | 'switching-source'
+    | 'failed'
+  >('idle');
+  const [playbackHealth, setPlaybackHealth] =
+    useState<PlaybackHealthResult | null>(null);
+  const [playbackErrorReason, setPlaybackErrorReason] = useState('');
+
+  useEffect(() => {
+    playbackStrategyRef.current = playbackStrategy;
+  }, [playbackStrategy]);
 
   // 总集数
   const totalEpisodes = detail?.episodes?.length || 0;
@@ -730,6 +776,68 @@ function PlayPageClient() {
     type: 'success' | 'error' | 'info' = 'info',
   ) => {
     setToast({ show: true, message, type });
+  };
+
+  const getMaxAutoSwitch = () => {
+    const runtimeValue =
+      typeof window !== 'undefined'
+        ? Number((window as any).RUNTIME_CONFIG?.PLAYBACK_MAX_AUTO_SWITCH)
+        : 0;
+    return Number.isFinite(runtimeValue) && runtimeValue > 0 ? runtimeValue : 3;
+  };
+
+  const getRuntimePlaybackProxyMode = (): PlaybackProxyMode => {
+    if (typeof window === 'undefined') return 'smart';
+    const saved = localStorage.getItem('playbackProxyMode');
+    const runtime =
+      saved || (window as any).RUNTIME_CONFIG?.PLAYBACK_PROXY_MODE || 'smart';
+    return runtime === 'direct' || runtime === 'proxy' || runtime === 'off'
+      ? runtime
+      : 'smart';
+  };
+
+  const getPlaybackStrategyLabel = (strategy: PlaybackStrategy) => {
+    switch (strategy) {
+      case 'direct':
+        return '直连';
+      case 'manifest-proxy':
+        return '列表代理';
+      case 'asset-proxy':
+        return '分片代理';
+      case 'full-proxy':
+        return '完整代理';
+      case 'native':
+        return '原生 HLS';
+      default:
+        return strategy;
+    }
+  };
+
+  const getPlaybackStatusLabel = () => {
+    switch (playbackStatus) {
+      case 'resolving':
+        return '解析播放链路';
+      case 'testing':
+        return '检测可播放性';
+      case 'loading-manifest':
+        return '获取播放列表';
+      case 'loading-first-segment':
+        return '等待首片/首帧';
+      case 'buffering':
+        return '缓冲中';
+      case 'recovering':
+        return '尝试恢复';
+      case 'switching-strategy':
+        return '切换播放链路';
+      case 'switching-source':
+        return '切换播放源';
+      case 'failed':
+        return '播放失败';
+      case 'playing':
+        return '播放中';
+      default:
+        return '准备播放';
+    }
   };
 
   const isPrivateLibrarySource = (source: string) =>
@@ -1417,6 +1525,10 @@ function PlayPageClient() {
 
           const testResult = await getVideoResolutionFromM3u8(episodeUrl, {
             timeoutMs: 9000,
+            source: source.source,
+            sourceName: source.source_name,
+            title: source.title,
+            episodeIndex: currentEpisodeIndexRef.current,
           });
           return { source, testResult };
         }),
@@ -1462,12 +1574,10 @@ function PlayPageClient() {
     // 计算每个结果的评分
     const resultsWithScore = successfulResults.map((result) => ({
       ...result,
-      score: calculateSourceScore(
-        result.testResult,
-        maxSpeed,
-        minPing,
-        maxPing,
-      ),
+      score:
+        calculateSourceScore(result.testResult, maxSpeed, minPing, maxPing) +
+        (result.testResult.score ? result.testResult.score * 0.35 : 0) +
+        getSourceQualityWeight(`${result.source.source}-${result.source.id}`),
     }));
 
     // 按综合评分排序，选择最佳播放源
@@ -2531,6 +2641,256 @@ function PlayPageClient() {
     }
   };
 
+  const resolveCurrentPlayback = useCallback(
+    async (
+      preferredStrategy: PlaybackStrategy | 'smart' = 'smart',
+      proxyMode: PlaybackProxyMode = getRuntimePlaybackProxyMode(),
+    ) => {
+      if (!videoUrl) return;
+
+      const requestRawUrl = videoUrl;
+      setPlaybackStatus('resolving');
+      setPlaybackErrorReason('');
+      setResolvedPlaybackUrl('');
+      setIsVideoLoading(true);
+      setVideoLoadingStage('initing');
+
+      try {
+        const response = await fetch('/api/playback/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sourceKey: currentSourceRef.current,
+            sourceName: detailRef.current?.source_name,
+            episodeUrl: requestRawUrl,
+            title: videoTitleRef.current,
+            episodeIndex: currentEpisodeIndexRef.current,
+            requestOrigin: window.location.origin,
+            proxyMode,
+            strategy: preferredStrategy,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`resolve-http-${response.status}`);
+        }
+
+        const resolved = (await response.json()) as {
+          finalUrl: string;
+          originalUrl: string;
+          type: PlaybackStreamType;
+          strategy: PlaybackStrategy;
+          health?: PlaybackHealthResult;
+        };
+
+        setPlaybackStrategy(resolved.strategy);
+        playbackStrategyRef.current = resolved.strategy;
+        setPlaybackStreamType(resolved.type);
+        setPlaybackHealth(resolved.health || null);
+        setResolvedPlaybackUrl(resolved.finalUrl);
+        setPlaybackStatus(
+          resolved.type === 'hls'
+            ? 'loading-manifest'
+            : 'loading-first-segment',
+        );
+
+        if (resolved.type === 'flv') {
+          setPlaybackErrorReason('当前项目未启用 flv.js，无法直接播放 FLV');
+          setPlaybackStatus('failed');
+        }
+
+        if (resolved.health) {
+          updateSourceQualityFromHealth(
+            `${currentSourceRef.current}-${currentIdRef.current}`,
+            resolved.health,
+          );
+        }
+      } catch (error) {
+        const reason =
+          error instanceof Error ? error.message : 'playback-resolve-failed';
+        setPlaybackErrorReason(reason);
+        setPlaybackStatus('failed');
+        markSourcePlaybackFailure(
+          `${currentSourceRef.current}-${currentIdRef.current}`,
+          reason,
+        );
+        setResolvedPlaybackUrl(requestRawUrl);
+      }
+    },
+    [videoUrl],
+  );
+
+  const switchToNextPlayableSource = useCallback(
+    async (reason: string): Promise<boolean> => {
+      const maxSwitch = getMaxAutoSwitch();
+      if (playbackAttemptsRef.current.sourceSwitches >= maxSwitch) {
+        return false;
+      }
+
+      if (!availableSources.length) return false;
+
+      const currentIndex = availableSources.findIndex(
+        (source) =>
+          source.source === currentSourceRef.current &&
+          source.id === currentIdRef.current,
+      );
+
+      for (let offset = 1; offset <= availableSources.length; offset++) {
+        const candidate =
+          availableSources[
+            (currentIndex + offset + availableSources.length) %
+              availableSources.length
+          ];
+        if (!candidate) continue;
+        if (
+          candidate.source === currentSourceRef.current &&
+          candidate.id === currentIdRef.current
+        ) {
+          continue;
+        }
+        const candidateKey = `${candidate.source}-${candidate.id}`;
+        if (isSourceTemporarilyBad(candidateKey)) continue;
+
+        playbackAttemptsRef.current.sourceSwitches += 1;
+        setPlaybackStatus('switching-source');
+        setPlaybackErrorReason(reason);
+        showToast(
+          `正在尝试备用播放源 ${playbackAttemptsRef.current.sourceSwitches}/${maxSwitch}`,
+          'info',
+        );
+        const currentPlayTime = artPlayerRef.current?.currentTime || 0;
+        if (currentPlayTime > 1) {
+          resumeTimeRef.current = currentPlayTime;
+        }
+        await handleSourceChange(
+          candidate.source,
+          candidate.id,
+          candidate.title,
+        );
+        return true;
+      }
+
+      return false;
+    },
+    [availableSources],
+  );
+
+  const handlePlaybackFailure = useCallback(
+    async (reason: string) => {
+      const sourceKey = `${currentSourceRef.current}-${currentIdRef.current}`;
+      markSourcePlaybackFailure(sourceKey, reason);
+      setPlaybackErrorReason(reason);
+      setPlaybackStatus('recovering');
+
+      const strategyOrder: PlaybackStrategy[] = [
+        'direct',
+        'manifest-proxy',
+        'asset-proxy',
+      ];
+      const currentStrategy = playbackStrategyRef.current;
+      const currentIndex = Math.max(0, strategyOrder.indexOf(currentStrategy));
+      const maxSwitch = getMaxAutoSwitch();
+
+      if (
+        playbackAttemptsRef.current.strategySwitches < maxSwitch &&
+        currentIndex < strategyOrder.length - 1
+      ) {
+        const nextStrategy = strategyOrder[currentIndex + 1];
+        playbackAttemptsRef.current.strategySwitches += 1;
+        const currentPlayTime = artPlayerRef.current?.currentTime || 0;
+        if (currentPlayTime > 1) {
+          resumeTimeRef.current = currentPlayTime;
+        }
+        setPlaybackStatus('switching-strategy');
+        showToast(
+          `正在尝试备用播放链路 ${playbackAttemptsRef.current.strategySwitches}/${maxSwitch}`,
+          'info',
+        );
+        await resolveCurrentPlayback(nextStrategy, 'smart');
+        return;
+      }
+
+      const switched = await switchToNextPlayableSource(reason);
+      if (!switched) {
+        setPlaybackStatus('failed');
+        setIsVideoLoading(false);
+        showToast('当前可用播放链路已尝试完毕，请手动换源', 'error');
+      }
+    },
+    [resolveCurrentPlayback, switchToNextPlayableSource],
+  );
+
+  const copyPlaybackDiagnostics = useCallback(async () => {
+    const diagnostics = {
+      title: videoTitleRef.current,
+      source: currentSourceRef.current,
+      sourceName: detailRef.current?.source_name,
+      episodeIndex: currentEpisodeIndexRef.current,
+      strategy: playbackStrategyRef.current,
+      status: playbackStatus,
+      urlType: playbackStreamType,
+      reason: playbackErrorReason,
+      rawUrl: videoUrl,
+      resolvedUrl: resolvedPlaybackUrl,
+      attempts: playbackAttemptsRef.current,
+      health: playbackHealth,
+    };
+
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      showToast('播放诊断信息已复制', 'success');
+    } catch {
+      showToast('复制诊断信息失败', 'error');
+    }
+  }, [
+    playbackErrorReason,
+    playbackHealth,
+    playbackStatus,
+    playbackStreamType,
+    resolvedPlaybackUrl,
+    videoUrl,
+  ]);
+
+  useEffect(() => {
+    if (!videoUrl) {
+      setResolvedPlaybackUrl('');
+      setPlaybackStatus('idle');
+      return;
+    }
+
+    playbackAttemptsRef.current = {
+      strategySwitches: 0,
+      sourceSwitches: playbackAttemptsRef.current.sourceSwitches,
+      lastRawUrl: videoUrl,
+    };
+    hlsErrorCountRef.current = {};
+    reportedPlaybackSuccessRef.current = '';
+    void resolveCurrentPlayback('smart');
+  }, [resolveCurrentPlayback, videoUrl]);
+
+  useEffect(() => {
+    if (!resolvedPlaybackUrl || playbackStatus === 'playing') {
+      return;
+    }
+
+    const timeoutMs =
+      playbackStatus === 'buffering'
+        ? 30000
+        : playbackStatus === 'loading-first-segment'
+          ? 20000
+          : playbackStatus === 'loading-manifest'
+            ? 10000
+            : 0;
+
+    if (!timeoutMs) return;
+
+    const timer = window.setTimeout(() => {
+      void handlePlaybackFailure(`${playbackStatus}-timeout`);
+    }, timeoutMs);
+
+    return () => window.clearTimeout(timer);
+  }, [handlePlaybackFailure, playbackStatus, resolvedPlaybackUrl]);
+
   // ---------------------------------------------------------------------------
   // 键盘快捷键
   // ---------------------------------------------------------------------------
@@ -2945,7 +3305,7 @@ function PlayPageClient() {
     if (
       !Artplayer ||
       !Hls ||
-      !videoUrl ||
+      !resolvedPlaybackUrl ||
       loading ||
       currentEpisodeIndex === null ||
       !artRef.current
@@ -2968,7 +3328,8 @@ function PlayPageClient() {
       setError('视频地址无效');
       return;
     }
-    console.log(videoUrl);
+    const playbackUrl = resolvedPlaybackUrl;
+    console.log(playbackUrl);
 
     // 检测是否为WebKit浏览器
     const isWebkit =
@@ -2981,7 +3342,7 @@ function PlayPageClient() {
       const savedPlaybackRate = loadPlaybackRate();
       lastPlaybackRateRef.current = savedPlaybackRate;
 
-      artPlayerRef.current.switch = videoUrl;
+      artPlayerRef.current.switch = playbackUrl;
       artPlayerRef.current.title = `${videoTitle} - 第${
         currentEpisodeIndex + 1
       }集`;
@@ -2989,7 +3350,7 @@ function PlayPageClient() {
       if (artPlayerRef.current?.video) {
         ensureVideoSource(
           artPlayerRef.current.video as HTMLVideoElement,
-          videoUrl,
+          playbackUrl,
         );
       }
       // 切换后立即恢复播放速率，防止被重置
@@ -3013,7 +3374,8 @@ function PlayPageClient() {
 
       artPlayerRef.current = new Artplayer({
         container: artRef.current,
-        url: videoUrl,
+        url: playbackUrl,
+        type: playbackStreamType === 'hls' ? 'm3u8' : undefined,
         poster: videoCover,
         volume: 0.7,
         isLive: false,
@@ -3079,6 +3441,17 @@ function PlayPageClient() {
               maxBufferLength: bufferConfig.maxBufferLength,
               backBufferLength: bufferConfig.backBufferLength,
               maxBufferSize: bufferConfig.maxBufferSize,
+              maxMaxBufferLength: 120,
+              maxBufferHole: 0.5,
+              manifestLoadingTimeOut: 10000,
+              manifestLoadingMaxRetry: 2,
+              levelLoadingTimeOut: 10000,
+              levelLoadingMaxRetry: 2,
+              fragLoadingTimeOut: 15000,
+              fragLoadingMaxRetry: 3,
+              startFragPrefetch: true,
+              testBandwidth: true,
+              capLevelToPlayerSize: true,
 
               /* 自定义loader */
               loader: blockAdEnabledRef.current
@@ -3175,9 +3548,90 @@ function PlayPageClient() {
               },
             );
 
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              const levels = hls.levels || [];
+              const preferred = levels
+                .map((level, index) => ({ level, index }))
+                .filter(({ level }) => {
+                  const height = level.height || 0;
+                  return height >= 720 && height <= 1080;
+                })
+                .sort((left, right) => {
+                  const heightDiff =
+                    (right.level.height || 0) - (left.level.height || 0);
+                  if (heightDiff !== 0) return heightDiff;
+                  return (right.level.bitrate || 0) - (left.level.bitrate || 0);
+                })[0];
+
+              if (preferred) {
+                hls.currentLevel = preferred.index;
+              }
+              setPlaybackStatus('loading-first-segment');
+            });
+
+            hls.on(Hls.Events.ERROR, function (_event: any, data: any) {
+              const reason = data?.details || data?.type || 'hls-error';
+              hlsErrorCountRef.current[reason] =
+                (hlsErrorCountRef.current[reason] || 0) + 1;
+
+              if (data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+                setPlaybackStatus('buffering');
+                try {
+                  video.currentTime += 0.1;
+                  hls.recoverMediaError();
+                } catch {
+                  // ignore local recovery failures
+                }
+                if (hlsErrorCountRef.current[reason] >= 3) {
+                  void handlePlaybackFailure(reason);
+                }
+                return;
+              }
+
+              if (!data?.fatal && hlsErrorCountRef.current[reason] < 3) {
+                return;
+              }
+
+              switch (data?.type) {
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                  if (hlsErrorCountRef.current[reason] <= 2) {
+                    setPlaybackStatus('recovering');
+                    hls.recoverMediaError();
+                    return;
+                  }
+                  break;
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                  if (
+                    ![
+                      Hls.ErrorDetails.MANIFEST_LOAD_ERROR,
+                      Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT,
+                      Hls.ErrorDetails.LEVEL_LOAD_ERROR,
+                      Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT,
+                      Hls.ErrorDetails.FRAG_LOAD_ERROR,
+                      Hls.ErrorDetails.FRAG_LOAD_TIMEOUT,
+                      Hls.ErrorDetails.KEY_LOAD_ERROR,
+                      Hls.ErrorDetails.KEY_LOAD_TIMEOUT,
+                    ].includes(data?.details)
+                  ) {
+                    hls.startLoad();
+                    if (hlsErrorCountRef.current[reason] <= 2) return;
+                  }
+                  break;
+                default:
+                  break;
+              }
+
+              try {
+                hls.stopLoad();
+              } catch {
+                // ignore
+              }
+              void handlePlaybackFailure(reason);
+            });
+
             hls.on(Hls.Events.ERROR, function (event: any, data: any) {
               console.error('HLS Error:', event, data);
-              if (data.fatal) {
+              if (data.fatal && data.__legacyRecovery === true) {
                 switch (data.type) {
                   case Hls.ErrorTypes.NETWORK_ERROR:
                     console.log('网络错误，尝试恢复...');
@@ -3456,6 +3910,16 @@ function PlayPageClient() {
         reportPrivateLibraryProgress('progress', true);
       });
 
+      artPlayerRef.current.on('video:waiting', () => {
+        setPlaybackStatus('buffering');
+        setIsVideoLoading(true);
+      });
+
+      artPlayerRef.current.on('video:playing', () => {
+        setPlaybackStatus('playing');
+        setIsVideoLoading(false);
+      });
+
       artPlayerRef.current.on('video:ended', () => {
         releaseWakeLock();
         reportPrivateLibraryProgress('played', true);
@@ -3525,6 +3989,8 @@ function PlayPageClient() {
 
         // 隐藏换源加载状态
         setIsVideoLoading(false);
+        setPlaybackStatus('playing');
+        setPlaybackErrorReason('');
       });
 
       // 监听视频时间更新事件，实现跳过片头片尾
@@ -3590,6 +4056,7 @@ function PlayPageClient() {
         if (artPlayerRef.current.currentTime > 0) {
           return;
         }
+        void handlePlaybackFailure('artplayer-error');
       });
 
       // 监听视频播放结束事件，自动播放下一集
@@ -3616,6 +4083,32 @@ function PlayPageClient() {
           lastSaveTimeRef.current = now;
         }
         reportPrivateLibraryProgress('progress');
+
+        const currentTime = artPlayerRef.current?.currentTime || 0;
+        const successKey = `${currentSourceRef.current}-${currentIdRef.current}-${currentEpisodeIndexRef.current}`;
+        if (
+          currentTime >= 60 &&
+          reportedPlaybackSuccessRef.current !== successKey
+        ) {
+          reportedPlaybackSuccessRef.current = successKey;
+          markSourcePlaybackSuccess(
+            `${currentSourceRef.current}-${currentIdRef.current}`,
+            {
+              firstSegmentMs: playbackHealth?.firstSegment?.timeToFirstByteMs,
+              ttfbMs: playbackHealth?.firstSegment?.timeToFirstByteMs,
+            },
+          );
+          void fetch('/api/playback/report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sourceKey: currentSourceRef.current,
+              ok: true,
+              firstSegmentMs: playbackHealth?.firstSegment?.timeToFirstByteMs,
+              ttfbMs: playbackHealth?.firstSegment?.timeToFirstByteMs,
+            }),
+          }).catch(() => undefined);
+        }
       });
 
       artPlayerRef.current.on('pause', () => {
@@ -3625,7 +4118,7 @@ function PlayPageClient() {
       if (artPlayerRef.current?.video) {
         ensureVideoSource(
           artPlayerRef.current.video as HTMLVideoElement,
-          videoUrl,
+          playbackUrl,
         );
       }
     } catch (err) {
@@ -3637,9 +4130,10 @@ function PlayPageClient() {
     Hls,
     blockAdEnabled,
     loading,
+    playbackStreamType,
     resetAudioTrackState,
+    resolvedPlaybackUrl,
     resolveActiveHlsTrackIndex,
-    videoUrl,
   ]);
 
   useEffect(() => {
@@ -4197,14 +4691,103 @@ function PlayPageClient() {
 
                 {/* 换源加载提示 - 使用播放器自带的加载动画 */}
                 {isVideoLoading && (
-                  <div className='absolute inset-0 z-50 flex items-center justify-center bg-black/70 rounded-xl'>
-                    <div className='flex flex-col items-center gap-3'>
+                  <div className='absolute inset-0 z-50 flex items-center justify-center bg-black/75 rounded-xl p-4'>
+                    <div className='w-full max-w-md rounded-lg border border-white/15 bg-black/70 p-4 text-white shadow-xl flex flex-col items-center gap-3'>
                       <div className='w-10 h-10 border-4 border-green-500 border-t-transparent rounded-full animate-spin' />
                       <span className='text-white/80 text-sm'>
                         {videoLoadingStage === 'sourceChanging'
                           ? '切换播放源...'
                           : '视频加载中...'}
                       </span>
+                      <div className='w-full space-y-2 text-xs text-white/70'>
+                        <div className='flex items-center justify-between gap-3'>
+                          <span>阶段</span>
+                          <span className='text-right text-white/90'>
+                            {getPlaybackStatusLabel()}
+                          </span>
+                        </div>
+                        <div className='flex items-center justify-between gap-3'>
+                          <span>源</span>
+                          <span className='truncate text-right text-white/90'>
+                            {detail?.source_name || currentSource || 'unknown'}
+                          </span>
+                        </div>
+                        <div className='flex items-center justify-between gap-3'>
+                          <span>策略</span>
+                          <span className='text-right text-white/90'>
+                            {getPlaybackStrategyLabel(playbackStrategy)}
+                          </span>
+                        </div>
+                        <div className='flex items-center justify-between gap-3'>
+                          <span>尝试</span>
+                          <span className='text-right text-white/90'>
+                            链路 {playbackAttemptsRef.current.strategySwitches}/
+                            {getMaxAutoSwitch()} · 换源{' '}
+                            {playbackAttemptsRef.current.sourceSwitches}/
+                            {getMaxAutoSwitch()}
+                          </span>
+                        </div>
+                        <div className='flex items-center justify-between gap-3'>
+                          <span>首片</span>
+                          <span className='text-right text-white/90'>
+                            {playbackHealth?.firstSegment?.ok
+                              ? `${playbackHealth.firstSegment.timeToFirstByteMs || 0}ms`
+                              : '未通过'}
+                          </span>
+                        </div>
+                        {playbackErrorReason && (
+                          <div className='break-words rounded border border-red-400/30 bg-red-500/10 px-2 py-1 text-red-100'>
+                            {playbackErrorReason}
+                          </div>
+                        )}
+                      </div>
+                      <div className='flex w-full flex-wrap justify-center gap-2'>
+                        <button
+                          type='button'
+                          onClick={() =>
+                            void resolveCurrentPlayback(playbackStrategy)
+                          }
+                          className='rounded border border-white/20 px-2.5 py-1 text-xs text-white/85 hover:bg-white/10'
+                        >
+                          重试
+                        </button>
+                        <button
+                          type='button'
+                          onClick={() =>
+                            void switchToNextPlayableSource(
+                              'manual-next-source',
+                            )
+                          }
+                          className='rounded border border-white/20 px-2.5 py-1 text-xs text-white/85 hover:bg-white/10'
+                        >
+                          下一个源
+                        </button>
+                        <button
+                          type='button'
+                          onClick={() =>
+                            void resolveCurrentPlayback('direct', 'direct')
+                          }
+                          className='rounded border border-white/20 px-2.5 py-1 text-xs text-white/85 hover:bg-white/10'
+                        >
+                          强制直连
+                        </button>
+                        <button
+                          type='button'
+                          onClick={() =>
+                            void resolveCurrentPlayback('asset-proxy', 'proxy')
+                          }
+                          className='rounded border border-white/20 px-2.5 py-1 text-xs text-white/85 hover:bg-white/10'
+                        >
+                          强制代理
+                        </button>
+                        <button
+                          type='button'
+                          onClick={() => void copyPlaybackDiagnostics()}
+                          className='rounded border border-white/20 px-2.5 py-1 text-xs text-white/85 hover:bg-white/10'
+                        >
+                          复制诊断
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}

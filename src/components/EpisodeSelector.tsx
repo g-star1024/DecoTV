@@ -57,6 +57,9 @@ function compareDefaultSourceOrder(a: SourceSortItem, b: SourceSortItem) {
 }
 
 function compareLatencyMetrics(a: SourceSortItem, b: SourceSortItem) {
+  const scoreDiff = (b.videoInfo?.score || 0) - (a.videoInfo?.score || 0);
+  if (scoreDiff !== 0) return scoreDiff;
+
   const pingDiff = (a.videoInfo?.pingTime || 0) - (b.videoInfo?.pingTime || 0);
   if (Math.abs(pingDiff) > RESPONSE_TIE_BREAKER_MS) return pingDiff;
 
@@ -119,6 +122,38 @@ function getSpeedTextClassName(speedKBps?: number) {
   if (speedKBps >= 2048) return 'text-green-600 dark:text-green-400';
   if (speedKBps >= 512) return 'text-sky-600 dark:text-sky-300';
   return 'text-orange-600 dark:text-orange-400';
+}
+
+function getStrategyLabel(strategy?: VideoInfo['recommendedStrategy']) {
+  switch (strategy) {
+    case 'direct':
+      return '直连';
+    case 'manifest-proxy':
+      return '列表代理';
+    case 'asset-proxy':
+      return '分片代理';
+    default:
+      return '待判断';
+  }
+}
+
+function getHealthLine(videoInfo: VideoInfo) {
+  const health = videoInfo.health;
+  if (!health) return null;
+  const apiText =
+    videoInfo.pingTime > 0 ? formatResponseTime(videoInfo.pingTime) : '未测';
+  const manifestText = health.manifest?.ok ? 'm3u8 成功' : 'm3u8 失败';
+  const firstSegmentText = health.firstSegment?.ok
+    ? `首片 ${formatResponseTime(health.firstSegment.timeToFirstByteMs || 0)}`
+    : '首片失败';
+  const corsText = health.cors?.checkedInBrowser
+    ? health.cors.manifestReadable
+      ? 'CORS 可直连'
+      : 'CORS 需代理'
+    : 'CORS 待浏览器确认';
+  return `API ${apiText} · ${manifestText} · ${firstSegmentText} · ${corsText} · ${getStrategyLabel(
+    health.recommendedStrategy,
+  )}`;
 }
 
 interface EpisodeSelectorProps {
@@ -308,6 +343,10 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       try {
         const info = await getVideoResolutionFromM3u8(episodeUrl, {
           timeoutMs: force ? 10000 : 8000,
+          source: source.source,
+          sourceName: source.source_name,
+          title: source.title,
+          episodeIndex: value - 1,
         });
         if (isCurrentTestScope()) {
           setVideoInfoMap((prev) => new Map(prev).set(sourceKey, info));
@@ -336,7 +375,7 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
         }
       }
     },
-    [getSourceKey, getTestEpisodeUrl],
+    [getSourceKey, getTestEpisodeUrl, value],
   );
 
   const handleManualSpeedTest = useCallback(async () => {
@@ -682,6 +721,20 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
     }
 
     if (!videoInfo) return null;
+
+    if (videoInfo.grade && !videoInfo.hasError) {
+      return {
+        label: `评分 ${videoInfo.grade}`,
+        className:
+          videoInfo.grade === 'A'
+            ? 'text-green-600 dark:text-green-400'
+            : videoInfo.grade === 'B'
+              ? 'text-sky-600 dark:text-sky-300'
+              : videoInfo.grade === 'C'
+                ? 'text-yellow-600 dark:text-yellow-400'
+                : 'text-red-600 dark:text-red-400',
+      };
+    }
 
     if (videoInfo.hasError) {
       return {
@@ -1068,8 +1121,17 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
 
                               if (videoInfo) {
                                 if (!videoInfo.hasError) {
+                                  const healthLine = getHealthLine(videoInfo);
                                   return (
                                     <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs'>
+                                      {healthLine && (
+                                        <div
+                                          className='w-full truncate font-medium text-emerald-600 dark:text-emerald-300'
+                                          title={healthLine}
+                                        >
+                                          {healthLine}
+                                        </div>
+                                      )}
                                       {videoInfo.pingTime > 0 && (
                                         <div
                                           className={`${getLatencyTextClassName(
